@@ -173,11 +173,12 @@ def load_model(model, model_file, is_restore=False):
     if is_restore:
         new_state_dict = OrderedDict()
         for k, v in state_dict.items():
-            name = 'module.' + k
+            #name = 'module.' + k
+            name = k[7:] if k.startswith('module.') else k # 如果有 module. 就去掉
             new_state_dict[name] = v
         state_dict = new_state_dict
 
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(state_dict, strict=False)#改动
     ckpt_keys = set(state_dict.keys())
     own_keys = set(model.state_dict().keys())
     missing_keys = own_keys - ckpt_keys

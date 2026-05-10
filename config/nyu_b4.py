@@ -22,13 +22,13 @@ C.dataset_name = 'NYUDepthv2'
 C.dataset_path = osp.join(C.root_dir, 'datasets', 'NYUDepthv2')
 C.rgb_root_folder = osp.join(C.dataset_path, 'RGB')
 C.rgb_format = '.jpg'
-C.gt_root_folder = osp.join(C.dataset_path, 'Label')
+C.gt_root_folder = osp.join(C.dataset_path, 'Label_40')
 C.gt_format = '.png'
 C.gt_transform = True
 # True when label 0 is invalid, you can also modify the function _transform_gt in dataloader.RGBXDataset
 # True for most dataset valid, Faslse for MFNet(?)
 C.x_root_folder = osp.join(C.dataset_path, 'HHA')
-C.x_format = '.jpg'
+C.x_format = '.png'
 C.x_is_single_channel = False # True for raw depth, thermal and aolp/dolp(not aolp/dolp tri) input
 C.train_source = osp.join(C.dataset_path, "train.txt")
 C.eval_source = osp.join(C.dataset_path, "test.txt")
@@ -58,15 +58,15 @@ C.decoder_embed_dim = 512
 C.optimizer = 'AdamW'
 
 """Train Config"""
-C.lr = 6e-5
+C.lr = 1e-4
 C.lr_power = 0.9
 C.momentum = 0.9
 C.weight_decay = 0.01
-C.batch_size = 4
+C.batch_size = 8
 C.nepochs = 500
 C.niters_per_epoch = C.num_train_imgs // C.batch_size  + 1
-C.num_workers = 16
-C.train_scale_array = [0.5, 0.75, 1, 1.25, 1.5, 1.75]
+C.num_workers = 6
+C.train_scale_array = [0.5, 0.75, 1, 1.25]
 C.warm_up_epoch = 10
 
 C.fix_bias = True
@@ -82,8 +82,8 @@ C.eval_flip = False # True #
 C.eval_crop_size = [480, 640] # [height weight]
 
 """Store Config"""
-C.checkpoint_start_epoch = 1
-C.checkpoint_step = 1
+C.checkpoint_start_epoch = 150
+C.checkpoint_step = 10
 
 """Path Config"""
 def add_path(path):

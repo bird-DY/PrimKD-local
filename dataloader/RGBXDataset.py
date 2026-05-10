@@ -37,7 +37,8 @@ class RGBXDataset(data.Dataset):
         else:
             item_name = self._file_names[index]
         
-        item_name=item_name.split('/')[1].split(self._rgb_format)[0]
+        #item_name=item_name.split('/')[1].split(self._rgb_format)[0]
+        item_name = item_name.strip().split('/')[-1].split('.')[0]#去掉路径和扩展名，得到纯文件名
         rgb_path = os.path.join(self._rgb_path, item_name.replace('.jpg','').replace('.png','') + self._rgb_format)
         x_path = os.path.join(self._x_path, item_name.replace('.jpg','').replace('.png','')  + self._x_format)
         gt_path = os.path.join(self._gt_path, item_name.replace('.jpg','').replace('.png','')  + self._gt_format)
@@ -60,6 +61,8 @@ class RGBXDataset(data.Dataset):
             x =  self._open_image(x_path, cv2.COLOR_BGR2RGB)
         
         if self.preprocess is not None:
+            if x is None or rgb is None:
+                raise RuntimeError(f"图片读取失败！请检查路径。\nRGB试图读取: {rgb_path}\nHHA试图读取: {x_path}")
             rgb, gt, x = self.preprocess(rgb, gt, x)
 
         if self._split_name == 'train':
@@ -109,7 +112,7 @@ class RGBXDataset(data.Dataset):
 
     @staticmethod
     def _gt_transform(gt):
-        return gt - 1 
+        return gt
 
     @classmethod
     def get_class_colors(*args):

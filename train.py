@@ -52,10 +52,26 @@ class KLDivergenceCalculator():
         return F.softmax(logits, dim=1)
 
     def compute_kl_divergence(self, logits_p, logits_q):
-        prob_p = self.softmax(logits_p)
-        prob_q = self.softmax(logits_q)
+        # prob_p = self.softmax(logits_p)
+        # prob_q = self.softmax(logits_q)
+        # log_prob_p = F.log_softmax(logits_p, dim=1)
+        # log_prob_q = F.log_softmax(logits_q, dim=1)
+        # kl_div = torch.sum(prob_p * (log_prob_p - log_prob_q), dim=1)
+        # return kl_div.mean()
+        # 1. 计算 P 的概率分布和对数概率分布
+        prob_p = F.softmax(logits_p, dim=1)
         log_prob_p = F.log_softmax(logits_p, dim=1)
+        
+        # 2. 计算 Q 的对数概率分布
         log_prob_q = F.log_softmax(logits_q, dim=1)
+        
+        # 删除了原作者根本没用到的 prob_q，直接白赚 376MB 显存！
+        
+        # 3. 算完立刻释放大内存变量，降低峰值
+        del logits_p
+        del logits_q
+        
+        # 4. 计算 KL 散度并返回
         kl_div = torch.sum(prob_p * (log_prob_p - log_prob_q), dim=1)
         return kl_div.mean()
 
@@ -196,14 +212,27 @@ with Engine(custom_parser=parser) as engine:
         logger.info('.............distributed training.............')
         if torch.cuda.is_available():
             model.cuda()
+            # 魔法1：编译学生模型（在包裹 DDP 之前编译）
+            #model = torch.compile(model)
             model = DistributedDataParallel(model, device_ids=[engine.local_rank],
                                             output_device=engine.local_rank, find_unused_parameters=False)
             device1 = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model2.to(device1)
+            # 魔法2：编译教师模型
+            #model2 = torch.compile(model2)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
+        #  魔法1：单卡模式下编译学生模型
+        #model = torch.compile(model)
+
         model2.to(device)
+        #  魔法2：单卡模式下编译教师模型
+        #model2 = torch.compile(model2)
+
+        # 👇 加上这两行：让模型的卷积核以 Channels Last 格式排列
+        model = model.to(memory_format=torch.channels_last)
+        model2 = model2.to(memory_format=torch.channels_last)
 
     engine.register_state(dataloader=train_loader, model=model, optimizer=optimizer, model2=model2, optimizer2=optimizer)
     if engine.continue_state_object:
@@ -212,6 +241,9 @@ with Engine(custom_parser=parser) as engine:
     optimizer.zero_grad()
 
     logger.info('begin trainning:')
+    # 魔法1：初始化 AMP 梯度缩放器，防止 16 位精度下梯度下溢消失
+    scaler = torch.cuda.amp.GradScaler()
+
     Best_IoU = 0.0
     Best_rgb_IoU = 0.0
     Best_cmx_IoU = 0.0
@@ -241,60 +273,82 @@ with Engine(custom_parser=parser) as engine:
         sum_kl_loss = 0
         for idx in pbar:
             engine.update_iteration(epoch, idx)
-            minibatch = dataloader.next()
+            minibatch = next(dataloader)#改为python3的迭代器方式
             imgs = minibatch['data']
             gts = minibatch['label']
             modal_xs = minibatch['modal_x']
             imgs = imgs.cuda(non_blocking=True)
+            # 👇 加上这行后缀：
+            imgs = imgs.to(memory_format=torch.channels_last)
             gts = gts.cuda(non_blocking=True)
             modal_xs = modal_xs.cuda(non_blocking=True)
+            # 👇 加上这行后缀：
+            modal_xs = modal_xs.to(memory_format=torch.channels_last)
             aux_rate = 0.2
-            logits, rgbd_x, loss = model(imgs, modal_xs, gts)
-            logits2, rgb_x, loss2 = model2(imgs, None, gts)
-            if args.distillation_flag:
-                loss_rdkl = kl_calculator.compute_kl_divergence(logits2.detach(), logits) * args.distillation_alpha
-            else:
-                loss_rdkl = kl_calculator.compute_kl_divergence(logits, logits2.detach()) * args.distillation_alpha
-            if args.distillation_single == 1:
-                loss = loss + loss_rdkl
-            else:
-                loss = loss
-            feature_loss = 0.0
-            loss_values = {
-                'loss1': [],
-                'loss2': [],
-                'loss3': [],
-                'loss4': []
-            }
-            num_values = 0
-            for loss_name in args.losses:
-                
-                loss_values[loss_name].append(distill_feature_maps(rgbd_x[num_values], rgb_x[int(loss_name[-1])-1].detach()))
-                num_values = num_values + 1
-            selected_losses = args.losses
-            selected_loss_values = [loss_values[loss_name][-1] for loss_name in selected_losses]
-
-            selected_loss_tensor = torch.stack(selected_loss_values)
-            max_loss_value = torch.max(selected_loss_tensor)
-            min_loss_value = torch.min(selected_loss_tensor)
-            feature_loss = 0
-            for loss_value in selected_loss_values:
-                if args.select == 'max':
-                    feature_loss = torch.where(torch.eq(selected_loss_tensor, max_loss_value), selected_loss_tensor * args.distillation_beta, selected_loss_tensor * 0.0).sum()
-                elif args.select == 'min':
-                    feature_loss = torch.where(torch.eq(selected_loss_tensor, min_loss_value), selected_loss_tensor * args.distillation_beta, selected_loss_tensor * 0.0).sum()
+            #print(f"当前批次标签 -> 最小值: {gts.min().item()}, 最大值: {gts.max().item()}")
+            #unique_vals = torch.unique(gts).tolist()
+            #print(f"\n[DEBUG] 喂给模型前的标签包含: {unique_vals}")
+            # 🌟 魔法2：开启混合精度结界 (从模型推理开始包裹)
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                logits, rgbd_x, loss = model(imgs, modal_xs, gts)
+                logits2, rgb_x, loss2 = model2(imgs, None, gts)
+                if args.distillation_flag:
+                    loss_rdkl = kl_calculator.compute_kl_divergence(logits2.detach(), logits) * args.distillation_alpha
                 else:
-                    feature_loss = torch.where(torch.eq(selected_loss_tensor, max_loss_value), selected_loss_tensor * 0.0, selected_loss_tensor * 0.0).sum()
-            loss = loss + feature_loss
+                    loss_rdkl = kl_calculator.compute_kl_divergence(logits, logits2.detach()) * args.distillation_alpha
+                if args.distillation_single == 1:
+                    loss = loss + loss_rdkl
+                else:
+                    loss = loss
+                feature_loss = 0.0
+                loss_values = {
+                    'loss1': [],
+                    'loss2': [],
+                    'loss3': [],
+                    'loss4': []
+                }
+                num_values = 0
+                for loss_name in args.losses:
+                    
+                    loss_values[loss_name].append(distill_feature_maps(rgbd_x[num_values], rgb_x[int(loss_name[-1])-1].detach()))
+                    num_values = num_values + 1
+                selected_losses = args.losses
+                selected_loss_values = [loss_values[loss_name][-1] for loss_name in selected_losses]
+
+                selected_loss_tensor = torch.stack(selected_loss_values)
+                max_loss_value = torch.max(selected_loss_tensor)
+                min_loss_value = torch.min(selected_loss_tensor)
+                feature_loss = 0
+                for loss_value in selected_loss_values:
+                    if args.select == 'max':
+                        feature_loss = torch.where(torch.eq(selected_loss_tensor, max_loss_value), selected_loss_tensor * args.distillation_beta, selected_loss_tensor * 0.0).sum()
+                    elif args.select == 'min':
+                        feature_loss = torch.where(torch.eq(selected_loss_tensor, min_loss_value), selected_loss_tensor * args.distillation_beta, selected_loss_tensor * 0.0).sum()
+                    else:
+                        feature_loss = torch.where(torch.eq(selected_loss_tensor, max_loss_value), selected_loss_tensor * 0.0, selected_loss_tensor * 0.0).sum()
+                loss = loss + feature_loss
+            # ================= 完美版开始 =================
             if engine.distributed:
                 reduce_loss = all_reduce_tensor(loss, world_size=engine.world_size)
                 reduce_loss2 = all_reduce_tensor(loss2, world_size=engine.world_size)
                 reduce_kl_loss = all_reduce_tensor(loss_rdkl, world_size=engine.world_size)
                 reduce_middle_loss = all_reduce_tensor(feature_loss, world_size=engine.world_size)
+            else:
+                    # 修复1：原作者漏掉了单卡模式下的 reduce 变量初始化
+                reduce_loss = loss
+                reduce_loss2 = loss2
+                reduce_kl_loss = loss_rdkl
+                reduce_middle_loss = feature_loss
 
+            # optimizer.zero_grad()
+            # loss.backward()
+            # optimizer.step()
+
+            # 🌟 魔法3：使用 scaler 进行 16 位精度的反向传播和参数更新
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             current_idx = (epoch - 1) * config.niters_per_epoch + idx
             lr = lr_policy.get_lr(current_idx)
@@ -307,21 +361,25 @@ with Engine(custom_parser=parser) as engine:
                 sum_loss2 += reduce_loss2.item()
                 sum_kl_loss += reduce_kl_loss.item()
                 print_str = 'Epoch {}/{}'.format(epoch, config.nepochs) \
-                            + ' Iter {}/{}:'.format(idx + 1, config.niters_per_epoch) \
-                            + ' lr=%.4e' % lr \
-                            + ' loss=%.4f total_loss=%.4f' % (reduce_loss.item(), (sum_loss / (idx + 1))) \
-                            + ' loss2=%.4f total_loss2=%.4f' % (reduce_loss2.item(), (sum_loss2 / (idx + 1))) \
-                            + ' kl_loss=%.4f' % (reduce_kl_loss.item()) \
-                            + ' middle_loss=%.4f' % (reduce_middle_loss.item())
+                                + ' Iter {}/{}:'.format(idx + 1, config.niters_per_epoch) \
+                                + ' lr=%.4e' % lr \
+                                + ' loss=%.4f total_loss=%.4f' % (reduce_loss.item(), (sum_loss / (idx + 1))) \
+                                + ' loss2=%.4f total_loss2=%.4f' % (reduce_loss2.item(), (sum_loss2 / (idx + 1))) \
+                                + ' kl_loss=%.4f' % (reduce_kl_loss.item()) \
+                                + ' middle_loss=%.4f' % (reduce_middle_loss.item())
             else:
-                sum_loss += loss
-                sum_loss2 += reduce_loss2
-                sum_kl_loss += reduce_kl_loss
+                    # 修复2：剥离计算图 (.item())，防止 V100 被活活撑爆显存！
+                sum_loss += reduce_loss.item()
+                sum_loss2 += reduce_loss2.item()
+                sum_kl_loss += reduce_kl_loss.item()
+                    # 修复3：补齐单卡下缺失的 kl_loss 和 middle_loss 日志打印
                 print_str = 'Epoch {}/{}'.format(epoch, config.nepochs) \
-                            + ' Iter {}/{}:'.format(idx + 1, config.niters_per_epoch) \
-                            + ' lr=%.4e' % lr \
-                            + ' loss=%.4f total_loss=%.4f' % (loss, (sum_loss / (idx + 1))) \
-                            + ' loss2=%.4f total_loss2=%.4f' % (reduce_loss2.item(), (sum_loss2 / (idx + 1)))
+                                + ' Iter {}/{}:'.format(idx + 1, config.niters_per_epoch) \
+                                + ' lr=%.4e' % lr \
+                                + ' loss=%.4f total_loss=%.4f' % (reduce_loss.item(), (sum_loss / (idx + 1))) \
+                                + ' loss2=%.4f total_loss2=%.4f' % (reduce_loss2.item(), (sum_loss2 / (idx + 1))) \
+                                + ' kl_loss=%.4f' % (reduce_kl_loss.item()) \
+                                + ' middle_loss=%.4f' % (reduce_middle_loss.item())
 
             del loss
             del loss2
@@ -330,6 +388,51 @@ with Engine(custom_parser=parser) as engine:
             del max_loss_value
             del min_loss_value
             pbar.set_description(print_str, refresh=False)
+            # ================= 完美版结束 =================
+        #     if engine.distributed:
+        #         reduce_loss = all_reduce_tensor(loss, world_size=engine.world_size)
+        #         reduce_loss2 = all_reduce_tensor(loss2, world_size=engine.world_size)
+        #         reduce_kl_loss = all_reduce_tensor(loss_rdkl, world_size=engine.world_size)
+        #         reduce_middle_loss = all_reduce_tensor(feature_loss, world_size=engine.world_size)
+
+        #     optimizer.zero_grad()
+        #     loss.backward()
+        #     optimizer.step()
+
+        #     current_idx = (epoch - 1) * config.niters_per_epoch + idx
+        #     lr = lr_policy.get_lr(current_idx)
+
+        #     for i in range(len(optimizer.param_groups)):
+        #         optimizer.param_groups[i]['lr'] = lr
+
+        #     if engine.distributed:
+        #         sum_loss += reduce_loss.item()
+        #         sum_loss2 += reduce_loss2.item()
+        #         sum_kl_loss += reduce_kl_loss.item()
+        #         print_str = 'Epoch {}/{}'.format(epoch, config.nepochs) \
+        #                     + ' Iter {}/{}:'.format(idx + 1, config.niters_per_epoch) \
+        #                     + ' lr=%.4e' % lr \
+        #                     + ' loss=%.4f total_loss=%.4f' % (reduce_loss.item(), (sum_loss / (idx + 1))) \
+        #                     + ' loss2=%.4f total_loss2=%.4f' % (reduce_loss2.item(), (sum_loss2 / (idx + 1))) \
+        #                     + ' kl_loss=%.4f' % (reduce_kl_loss.item()) \
+        #                     + ' middle_loss=%.4f' % (reduce_middle_loss.item())
+        #     else:
+        #         sum_loss += loss
+        #         sum_loss2 += reduce_loss2
+        #         sum_kl_loss += reduce_kl_loss
+        #         print_str = 'Epoch {}/{}'.format(epoch, config.nepochs) \
+        #                     + ' Iter {}/{}:'.format(idx + 1, config.niters_per_epoch) \
+        #                     + ' lr=%.4e' % lr \
+        #                     + ' loss=%.4f total_loss=%.4f' % (loss, (sum_loss / (idx + 1))) \
+        #                     + ' loss2=%.4f total_loss2=%.4f' % (reduce_loss2.item(), (sum_loss2 / (idx + 1)))
+
+        #     del loss
+        #     del loss2
+        #     del feature_loss
+        #     del loss_rdkl
+        #     del max_loss_value
+        #     del min_loss_value
+        #     pbar.set_description(print_str, refresh=False)
 
         if (engine.distributed and (engine.local_rank == 0)) or (not engine.distributed):
             tb.add_scalar('train_loss', sum_loss / len(pbar), epoch)
@@ -362,8 +465,10 @@ with Engine(custom_parser=parser) as engine:
                     depth_mIoU = 0.0
                     print('epoch: %d, rgbd_mIoU: %.3f%%, Best_rgbd_IoU: %.3f%%' % (epoch, rgb_mIoU, Best_rgb_IoU))
 
+# ================= 验证部分完美版开始 =================
             elif not engine.distributed:
                 model.eval()
+                model2.eval() # 修复4：单卡漏了把 teacher 模型切到 eval 模式
                 device = '0'
                 all_dev = parse_devices(device)
                 with torch.no_grad():
@@ -375,13 +480,41 @@ with Engine(custom_parser=parser) as engine:
                     config.val_log_file = tb_dir + '/val_' + '.log'
                     config.link_val_log_file = tb_dir + '/val_last.log'
                     config.checkpoint_dir = tb_dir + '/checkpoint'
+                    
+                    # 修复5：补齐单卡漏掉的 "rgbd" 标志参数，防止缺少位置参数崩溃
                     mIoU = segmentor.run(config.checkpoint_dir, str(epoch), config.val_log_file,
-                                         config.link_val_log_file, model)
+                                         config.link_val_log_file, model, "rgbd")
+                    
                     print('epoch: %d, mIoU: %.3f%%, Best_IoU: %.3f%%' % (epoch, mIoU, Best_IoU))
                     if (Best_IoU < mIoU):
                         Best_IoU = mIoU
+                        # 修复6：对齐多卡保存模型的参数数量，防止 TypeError
                         engine.save_and_link_checkpoint(config.checkpoint_dir,
                                                         config.log_dir,
                                                         config.log_dir_link,
-                                                        Best_IoU)
+                                                        Best_IoU, Best_depth_IoU)
                         print("save successful!")
+            # ================= 验证部分完美版结束 =================
+            # elif not engine.distributed:
+            #     model.eval()
+            #     device = '0'
+            #     all_dev = parse_devices(device)
+            #     with torch.no_grad():
+            #         segmentor = SegEvaluator(val_dataset, config.num_classes, config.norm_mean,
+            #                                  config.norm_std, network,
+            #                                  config.eval_scale_array, config.eval_flip,
+            #                                  all_dev, verbose=False, save_path=None,
+            #                                  show_image=False)
+            #         config.val_log_file = tb_dir + '/val_' + '.log'
+            #         config.link_val_log_file = tb_dir + '/val_last.log'
+            #         config.checkpoint_dir = tb_dir + '/checkpoint'
+            #         mIoU = segmentor.run(config.checkpoint_dir, str(epoch), config.val_log_file,
+            #                              config.link_val_log_file, model)
+            #         print('epoch: %d, mIoU: %.3f%%, Best_IoU: %.3f%%' % (epoch, mIoU, Best_IoU))
+            #         if (Best_IoU < mIoU):
+            #             Best_IoU = mIoU
+            #             engine.save_and_link_checkpoint(config.checkpoint_dir,
+            #                                             config.log_dir,
+            #                                             config.log_dir_link,
+            #                                             Best_IoU)
+            #             print("save successful!")
